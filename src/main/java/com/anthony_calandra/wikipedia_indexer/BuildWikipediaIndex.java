@@ -61,13 +61,14 @@ import org.kohsuke.args4j.ParserProperties;
 import tl.lin.data.array.ArrayListWritable;
 import tl.lin.data.fd.Object2IntFrequencyDistribution;
 import tl.lin.data.fd.Object2IntFrequencyDistributionEntry;
-import tl.lin.data.pair.PairOfInts;
+import tl.lin.data.pair.PairOfFloatInt;
 import tl.lin.data.pair.PairOfObjectInt;
 import tl.lin.data.pair.PairOfStringLong;
 
 import java.io.DataOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -75,8 +76,16 @@ import java.util.List;
 public class BuildWikipediaIndex extends Configured implements Tool {
   private static final Logger LOG = Logger.getLogger(BuildWikipediaIndex.class);
 
-  private static final class ArticleMapper extends Mapper<LongWritable, Text, PairOfStringLong, PairOfInts> {
-    private static final Object2IntFrequencyDistribution<String> COUNTS =
+  public static byte[] float2ByteArray(float value) {
+    return ByteBuffer.allocate(4).putFloat(value).array();
+  }
+
+  public static float byteArray2Float(byte[] bytes) {
+    return ByteBuffer.wrap(bytes).getFloat();
+  }
+
+  private static final class ArticleMapper extends Mapper<LongWritable, Text, PairOfStringLong, PairOfFloatInt> {
+    private static final Object2IntFrequencyDistribution<String> TERM_COUNTS =
         new Object2IntFrequencyDistributionEntry<>();
 
     @Override
@@ -87,22 +96,24 @@ public class BuildWikipediaIndex extends Configured implements Tool {
       List<String> tokens = Tokenizer.tokenize(articleData[1]);
 
       // Build a histogram of the terms.
-      COUNTS.clear();
+      TERM_COUNTS.clear();
       for (String token : tokens) {
-        COUNTS.increment(token);
+        TERM_COUNTS.increment(token);
       }
 
       // Emit postings.
-      for (PairOfObjectInt<String> e : COUNTS) {
+      for (PairOfObjectInt<String> e : TERM_COUNTS) {
         // (term, articleOffset) => (termFrequency, articleId)
         int termFrequency = e.getRightElement();
         context.write(new PairOfStringLong(e.getLeftElement(), articleOffset.get()),
-                      new PairOfInts(termFrequency, articleId));
+                      new PairOfFloatInt((float) termFrequency / tokens.size(), articleId));
       }
     }
   }
 
-  private static final class ArticleReducer extends Reducer<PairOfStringLong, PairOfInts, Text, BytesWritable> {
+  private static final class ArticleReducer extends Reducer<PairOfStringLong, PairOfFloatInt, Text, BytesWritable> {
+    private static final Object2IntFrequencyDistribution<Integer> ARTICLE_COUNTS =
+        new Object2IntFrequencyDistributionEntry<>();
     private static final Text TERM = new Text();
     private ByteArrayOutputStream postingByteArrayStream = new ByteArrayOutputStream();
     private DataOutputStream postingOutStream = new DataOutputStream(postingByteArrayStream);
@@ -115,12 +126,13 @@ public class BuildWikipediaIndex extends Configured implements Tool {
       prev = null;
       prevArticleOffset = 0;
       df = 0;
+      ARTICLE_COUNTS.clear();
     }
 
     @Override
-    public void reduce(PairOfStringLong key, Iterable<PairOfInts> values, Context context)
+    public void reduce(PairOfStringLong key, Iterable<PairOfFloatInt> values, Context context)
         throws IOException, InterruptedException {
-      Iterator<PairOfInts> iter = values.iterator();
+      Iterator<PairOfFloatInt> iter = values.iterator();
       String term = key.getLeftElement();
       long articleOffset = key.getRightElement();
       if (prev != null && !term.equals(prev)) {
@@ -138,13 +150,13 @@ public class BuildWikipediaIndex extends Configured implements Tool {
       }
 
       df++;
-      PairOfInts articleData = iter.next();
+      PairOfFloatInt articleData = iter.next();
       if (iter.hasNext()) {
         // Should never get here -- sanity check.
         throw new InterruptedException("Reducer given more than one article.");
       }
 
-      int tf = articleData.getLeftElement();
+      float tf = articleData.getLeftElement();
       int articleId = articleData.getRightElement();
       if (articleOffset - prevArticleOffset < 0) {
         throw new InterruptedException(
@@ -152,8 +164,9 @@ public class BuildWikipediaIndex extends Configured implements Tool {
       }
 
       WritableUtils.writeVLong(postingOutStream, articleOffset - prevArticleOffset);
-      WritableUtils.writeVInt(postingOutStream, tf);
+      WritableUtils.writeCompressedByteArray(postingOutStream, float2ByteArray(tf));
       WritableUtils.writeVInt(postingOutStream, articleId);
+      ARTICLE_COUNTS.set(articleId, 1);
       prev = term;
       prevArticleOffset = articleOffset;
     }
@@ -172,14 +185,24 @@ public class BuildWikipediaIndex extends Configured implements Tool {
         postingByteArrayStream.reset();
       }
 
+      // Store total number of articles.
+      // Setting the term to a tilde is a really hacky way of doing this...
+      TERM.set("~");
+      postingOutStream.flush();
+      postingByteArrayStream.flush();
+      ByteArrayOutputStream mapfileElementByteArrayStream = new ByteArrayOutputStream();
+      DataOutputStream mapfileElementOutStream = new DataOutputStream(mapfileElementByteArrayStream);
+      WritableUtils.writeVInt(mapfileElementOutStream, ARTICLE_COUNTS.getNumberOfEvents());
+      context.write(TERM, new BytesWritable(mapfileElementByteArrayStream.toByteArray()));
+
       postingOutStream.close();
       postingByteArrayStream.close();
     }
   }
 
-  private static final class ArticlePartitioner extends Partitioner<PairOfStringLong, PairOfInts> {
+  private static final class ArticlePartitioner extends Partitioner<PairOfStringLong, PairOfFloatInt> {
     @Override
-    public int getPartition(PairOfStringLong key, PairOfInts value, int numReduceTasks) {
+    public int getPartition(PairOfStringLong key, PairOfFloatInt value, int numReduceTasks) {
       return (key.getLeftElement().hashCode() & Integer.MAX_VALUE) % numReduceTasks;
     }
   }
@@ -225,7 +248,7 @@ public class BuildWikipediaIndex extends Configured implements Tool {
     FileOutputFormat.setOutputPath(job, new Path(args.output));
 
     job.setMapOutputKeyClass(PairOfStringLong.class);
-    job.setMapOutputValueClass(PairOfInts.class);
+    job.setMapOutputValueClass(PairOfFloatInt.class);
     job.setOutputKeyClass(Text.class);
     job.setOutputValueClass(BytesWritable.class);
     job.setOutputFormatClass(MapFileOutputFormat.class);

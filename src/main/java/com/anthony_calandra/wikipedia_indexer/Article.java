@@ -20,14 +20,26 @@
 package com.anthony_calandra.wikipedia_indexer;
 
 class Article implements Comparable<Article> {
-  public long articleIndexOffset;
-  public int articleId;
-  public int termFrequency;
+  private long articleIndexOffset;
+  private int articleId;
+  private double tfidf;
 
-  public Article(long articleIndexOffset, int articleId, int termFrequency) {
+  public Article(long articleIndexOffset, int articleId, double tfidf) {
     this.articleIndexOffset = articleIndexOffset;
     this.articleId = articleId;
-    this.termFrequency = termFrequency;
+    this.tfidf = tfidf;
+  }
+
+  public long getArticleIndexOffset() {
+    return articleIndexOffset;
+  }
+
+  public int getArticleId() {
+    return articleId;
+  }
+
+  public double getTfidf() {
+    return tfidf;
   }
 
   @Override
@@ -46,12 +58,6 @@ class Article implements Comparable<Article> {
 
   @Override
   public int compareTo(Article other) {
-    if (articleId == other.articleId) {
-      return 0;
-    } else if (articleId < other.articleId) {
-      return -1;
-    } else {
-      return 1;
-    }
+    return Integer.compare(articleId, other.articleId);
   }
 }

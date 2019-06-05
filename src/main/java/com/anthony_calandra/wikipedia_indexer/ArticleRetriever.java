@@ -62,12 +62,16 @@ import java.io.ByteArrayInputStream;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.Set;
 import java.util.Stack;
 import java.util.TreeSet;
 
 public class ArticleRetriever {
+  private static final String DOCUMENT_COUNT_ID = "~";
   private static final Logger LOG = Logger.getLogger(ArticleRetriever.class);
   private MapFile.Reader[] index;
   private FSDataInputStream collection;
@@ -76,6 +80,10 @@ public class ArticleRetriever {
   private int resultLimit;
 
   private ArticleRetriever() {}
+
+  public static float byteArray2Float(byte[] bytes) {
+    return ByteBuffer.wrap(bytes).getFloat();
+  }
 
   private void initialize(String indexPath, String collectionPath, int resultLimit, FileSystem fs)
       throws IOException {
@@ -116,15 +124,24 @@ public class ArticleRetriever {
       }
     }
 
-    Set<Article> set = stack.pop();
+    System.out.println();
+    System.out.println("tf-idf\tArticle ID\tArticle");
+    ArrayList<Article> set = new ArrayList<>(stack.pop());
+    Collections.sort(set, new Comparator<Article>() {
+      @Override
+      public int compare(Article article1, Article article2) {
+        return Double.compare(article2.getTfidf(), article1.getTfidf());
+      }
+    });
+
     int results = 0;
     for (Article i : set) {
       if (results == resultLimit) {
         break;
       }
 
-      String line = fetchLine(i.articleIndexOffset);
-      System.out.println(line);
+      String line = fetchLine(i.getArticleIndexOffset());
+      System.out.println(i.getTfidf() + "\t" + line);
       results++;
     }
   }
@@ -136,14 +153,8 @@ public class ArticleRetriever {
   private void performAND() {
     Set<Article> s1 = stack.pop();
     Set<Article> s2 = stack.pop();
-    Set<Article> sn = new TreeSet<>();
-    for (Article n : s1) {
-      if (s2.contains(n)) {
-        sn.add(n);
-      }
-    }
-
-    stack.push(sn);
+    s1.retainAll(s2);
+    stack.push(s1);
   }
 
   private void performOR() {
@@ -170,6 +181,23 @@ public class ArticleRetriever {
     return set;
   }
 
+  private int fetchNumberOfDocuments() throws IOException {
+    Text key = new Text();
+    BytesWritable value = new BytesWritable();
+    int partition = (DOCUMENT_COUNT_ID.hashCode() & Integer.MAX_VALUE) % reducers;
+
+    key.set(DOCUMENT_COUNT_ID);
+    // Document count not found in the index.
+    if (index[partition].get(key, value) == null) {
+      return -1;
+    }
+
+    byte[] bytes = value.getBytes();
+    ByteArrayInputStream postingByteArrayStream = new ByteArrayInputStream(bytes);
+    DataInputStream postingInStream = new DataInputStream(postingByteArrayStream);
+    return WritableUtils.readVInt(postingInStream);
+  }
+
   private ArrayList<Article> fetchPostings(String term) throws IOException {
     ArrayList<Article> postList = new ArrayList<>();
     Text key = new Text();
@@ -182,6 +210,11 @@ public class ArticleRetriever {
       return postList;
     }
 
+    int numTotalDocuments = fetchNumberOfDocuments();
+    if (numTotalDocuments < 0) {
+      return postList;
+    }
+
     byte[] bytes = value.getBytes();
     ByteArrayInputStream postingByteArrayStream = new ByteArrayInputStream(bytes);
     DataInputStream postingInStream = new DataInputStream(postingByteArrayStream);
@@ -190,10 +223,11 @@ public class ArticleRetriever {
     long articleIndexOffset = 0;
     for (int numDocs = 0; numDocs < df; numDocs++) {
       long offsetGap = WritableUtils.readVLong(postingInStream);
-      int tf = WritableUtils.readVInt(postingInStream);
+      float tf = byteArray2Float(WritableUtils.readCompressedByteArray(postingInStream));
       int articleId = WritableUtils.readVInt(postingInStream);
+      double idf = Math.log((double) numTotalDocuments / (1 + df));
       articleIndexOffset += offsetGap;
-      postList.add(new Article(articleIndexOffset, articleId, tf));
+      postList.add(new Article(articleIndexOffset, articleId, (double) tf * idf));
     }
 
     return postList;
